@@ -31,7 +31,7 @@
 
   <div class="card">
     <h2>How to Use</h2>
-    <p>1. Paste one participant per row into <b>People</b>. Spreadsheet pastes with tabs are fine; the first non-empty cell on each row is used as the name.</p>
+    <p>1. Paste one participant per row into <b>People</b>. Spreadsheet pastes with tabs are fine; the first non-empty cell on each row is used as the name and the optional second non-empty cell is used as the location.</p>
     <p>2. Optional: paste rows into <b>Avoid Pairing</b> where each row lists people who should not be paired with each other in any combination. Use tabs, commas, or both. Example: <code>Alice[TAB]Bob[TAB]Carol</code> or <code>Alice, Bob, Carol</code>.</p>
     <p>3. Optional: paste past pairings into <b>Recent History</b> with one pair per row. The first two non-empty cells are used. More recent rows should be lower in the box if you want them penalized more heavily.</p>
     <p>4. Names in <b>Avoid Pairing</b> and <b>Recent History</b> are matched to <b>People</b> case-insensitively. Full names, unique first names, and email addresses like <code>john.a.doe@example.com</code> are accepted. If any reference is ambiguous or unknown, generation stops and shows a warning.</p>
@@ -42,8 +42,8 @@
   <div class="grid">
     <section class="card">
       <h2>People</h2>
-      <p class="muted">One person per row.</p>
-      <textarea id="peopleInput" placeholder="Alice&#10;Bob&#10;Carol&#10;Dave"></textarea>
+      <p class="muted">One person per row. Optional second column: location.</p>
+      <textarea id="peopleInput" placeholder="Alice&#9;San Francisco&#10;Bob&#9;New York&#10;Carol&#10;Dave&#9;London"></textarea>
     </section>
 
     <section class="card">
@@ -67,7 +67,7 @@
       <a id="downloadBtn" class="button secondary" download="pairings.csv" aria-disabled="true">Download CSV</a>
     </div>
     <div id="status" class="status muted"></div>
-    <p class="muted">Score meaning: lower is better. A score of <code>0</code> means no avoid rules or recent-history penalties were triggered. Higher scores mean the result had to reuse recent pairings or break avoid-pairing rules because a perfect pairing was not available.</p>
+    <p class="muted">Score meaning: lower is better. Avoid rules and recent-history matches increase the score; matching people in different non-empty locations decreases it.</p>
     <div id="output"></div>
   </div>
 
@@ -76,6 +76,7 @@
     const SWAP_PASSES = 4;
     const PENALTY_AVOID = 100000;
     const PENALTY_HISTORY = 250;
+    const BONUS_DIFFERENT_LOCATION = 40;
 
     const peopleInput = document.getElementById("peopleInput");
     const avoidInput = document.getElementById("avoidInput");
@@ -89,6 +90,7 @@
     const STORAGE_KEY = "coffee-chat-pairer-inputs";
 
     let lastResult = [];
+    let lastLocations = new Map();
     let lastCsvUrl = "";
 
     const norm = (value) => value.trim().replace(/\s+/g, " ");
@@ -98,6 +100,17 @@
     function setStatus(message, kind = "muted") {
       statusEl.className = `status ${kind}`;
       statusEl.textContent = message;
+    }
+
+    function setGeneratingState(isGenerating) {
+      generateBtn.disabled = isGenerating;
+      regenBtn.disabled = isGenerating || !lastResult.length;
+      copyBtn.disabled = isGenerating || !lastResult.length;
+      if (isGenerating) setStatus("Generating pairings...", "muted");
+    }
+
+    function waitForPaint() {
+      return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
     }
 
     function saveInputs() {
@@ -142,6 +155,10 @@
       return tokens.length ? tokens : null;
     }
 
+    function canonicalPersonTokens(value) {
+      return emailTokens(value) || nameTokens(value);
+    }
+
     function buildResolver(people) {
       const exactMap = new Map();
       const sequenceMap = new Map();
@@ -149,7 +166,7 @@
 
       for (const person of people) {
         const exactKey = norm(person).toLowerCase();
-        const tokens = nameTokens(person);
+        const tokens = canonicalPersonTokens(person);
         exactMap.set(exactKey, person);
 
         const seqKey = tokenKey(tokens);
@@ -216,15 +233,18 @@
       const seen = new Set();
       const duplicates = [];
       const people = [];
+      const locations = new Map();
       for (const row of rowsFromText(text)) {
         const name = row[0];
+        const location = row[1] || "";
         if (seen.has(name)) duplicates.push(name);
         else {
           seen.add(name);
           people.push(name);
+          locations.set(name, location);
         }
       }
-      return { people, duplicates };
+      return { people, duplicates, locations };
     }
 
     function parseAvoid(text, resolvePerson) {
@@ -270,13 +290,29 @@
       return copy;
     }
 
-    function scorePairings(pairings, avoidSet, historyMap) {
-      let score = 0;
-      for (const [a, b] of pairings) {
+    function buildPairCost(people, avoidSet, historyMap, locations) {
+      const cache = new Map();
+      const normalizedLocations = new Map(
+        people.map((person) => [person, norm(locations.get(person) || "").toLowerCase()])
+      );
+
+      return function pairCost(a, b) {
         const key = pairKey(a, b);
+        if (cache.has(key)) return cache.get(key);
+        let score = 0;
+        const locationA = normalizedLocations.get(a) || "";
+        const locationB = normalizedLocations.get(b) || "";
         if (avoidSet.has(key)) score += PENALTY_AVOID;
         score += historyMap.get(key) || 0;
-      }
+        if (locationA && locationB && locationA !== locationB) score -= BONUS_DIFFERENT_LOCATION;
+        cache.set(key, score);
+        return score;
+      };
+    }
+
+    function scorePairings(pairings, pairCost) {
+      let score = 0;
+      for (const [a, b] of pairings) score += pairCost(a, b);
       return score;
     }
 
@@ -287,24 +323,22 @@
       return pairings;
     }
 
-    function improvePairings(pairings, avoidSet, historyMap) {
+    function improvePairings(pairings, pairCost) {
       const current = pairings.map((pair) => pair.slice());
-      let bestScore = scorePairings(current, avoidSet, historyMap);
+      let bestScore = scorePairings(current, pairCost);
       for (let pass = 0; pass < SWAP_PASSES; pass++) {
         let changed = false;
         for (let i = 0; i < current.length; i++) {
           for (let j = i + 1; j < current.length; j++) {
             const [a, b] = current[i];
             const [c, d] = current[j];
+            const baseScore = bestScore - pairCost(a, b) - pairCost(c, d);
             const options = [
               [[a, c], [b, d]],
               [[a, d], [b, c]]
             ];
             for (const option of options) {
-              const trial = current.map((pair) => pair.slice());
-              trial[i] = option[0];
-              trial[j] = option[1];
-              const trialScore = scorePairings(trial, avoidSet, historyMap);
+              const trialScore = baseScore + pairCost(option[0][0], option[0][1]) + pairCost(option[1][0], option[1][1]);
               if (trialScore < bestScore) {
                 current[i] = option[0];
                 current[j] = option[1];
@@ -319,12 +353,12 @@
       return { pairings: current, score: bestScore };
     }
 
-    function buildPairings(people, avoidSet, historyMap) {
+    function buildPairings(people, avoidSet, historyMap, locations) {
+      const pairCost = buildPairCost(people, avoidSet, historyMap, locations);
       let best = { pairings: randomPairings(people), score: Infinity };
       for (let i = 0; i < ATTEMPTS; i++) {
-        const improved = improvePairings(randomPairings(people), avoidSet, historyMap);
+        const improved = improvePairings(randomPairings(people), pairCost);
         if (improved.score < best.score) best = improved;
-        if (best.score === 0) break;
       }
       return best;
     }
@@ -333,9 +367,14 @@
       return value.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
     }
 
-    function renderOutput(pairings) {
+    function displayName(name, locations) {
+      const location = norm(locations.get(name) || "");
+      return location ? `${name} (${location})` : name;
+    }
+
+    function renderOutput(pairings, locations) {
       const rows = pairings.map(([a, b], index) =>
-        `<tr><td>${index + 1}</td><td>${escapeHtml(a)}</td><td>${escapeHtml(b)}</td></tr>`
+        `<tr><td>${index + 1}</td><td>${escapeHtml(displayName(a, locations))}</td><td>${escapeHtml(displayName(b, locations))}</td></tr>`
       ).join("");
       outputEl.innerHTML = `
         <table>
@@ -345,13 +384,13 @@
       `;
     }
 
-    function toTsv(pairings) {
-      return ["Person 1\tPerson 2"].concat(pairings.map(([a, b]) => `${a}\t${b}`)).join("\n");
+    function toTsv(pairings, locations) {
+      return ["Person 1\tPerson 2"].concat(pairings.map(([a, b]) => `${displayName(a, locations)}\t${displayName(b, locations)}`)).join("\n");
     }
 
-    function toCsv(pairings) {
+    function toCsv(pairings, locations) {
       const quote = (value) => `"${value.replace(/"/g, '""')}"`;
-      return ["Person 1,Person 2"].concat(pairings.map(([a, b]) => `${quote(a)},${quote(b)}`)).join("\n");
+      return ["Person 1,Person 2"].concat(pairings.map(([a, b]) => `${quote(displayName(a, locations))},${quote(displayName(b, locations))}`)).join("\n");
     }
 
     function setDownload(csvText) {
@@ -364,6 +403,7 @@
 
     function clearOutput() {
       lastResult = [];
+      lastLocations = new Map();
       outputEl.innerHTML = "";
       copyBtn.disabled = true;
       regenBtn.disabled = true;
@@ -374,29 +414,42 @@
       lastCsvUrl = "";
     }
 
-    function runPairing() {
+    async function runPairing() {
       clearOutput();
-      const { people, duplicates } = parsePeople(peopleInput.value);
-      if (people.length < 2) return setStatus("Enter at least two people.", "error");
-      if (people.length % 2) return setStatus(`There are ${people.length} people. An even number is required to make complete pairs.`, "warn");
+      setGeneratingState(true);
+      await waitForPaint();
+      const { people, duplicates, locations } = parsePeople(peopleInput.value);
+      if (people.length < 2) {
+        setGeneratingState(false);
+        return setStatus("Enter at least two people.", "error");
+      }
+      if (people.length % 2) {
+        setGeneratingState(false);
+        return setStatus(`There are ${people.length} people. An even number is required to make complete pairs.`, "warn");
+      }
 
       const resolvePerson = buildResolver(people);
       const { edges: avoidSet, issues: avoidIssues } = parseAvoid(avoidInput.value, resolvePerson);
       const { penalties: historyMap, issues: historyIssues } = parseHistory(historyInput.value, resolvePerson);
       const issues = avoidIssues.concat(historyIssues);
-      if (issues.length) return setStatus(formatIssues(issues), "warn");
-      const { pairings, score } = buildPairings(people, avoidSet, historyMap);
+      if (issues.length) {
+        setGeneratingState(false);
+        return setStatus(formatIssues(issues), "warn");
+      }
+      const { pairings, score } = buildPairings(people, avoidSet, historyMap, locations);
       lastResult = pairings;
-      renderOutput(pairings);
+      lastLocations = new Map(locations);
+      renderOutput(pairings, locations);
       copyBtn.disabled = false;
       regenBtn.disabled = false;
-      setDownload(toCsv(pairings));
+      setDownload(toCsv(pairings, locations));
 
       const forcedAvoids = pairings.filter(([a, b]) => avoidSet.has(pairKey(a, b))).length;
       const duplicateNote = duplicates.length ? ` Ignored duplicate names: ${duplicates.join(", ")}.` : "";
       const constraintNote = forcedAvoids
         ? ` Generated the lowest-penalty result found, including ${forcedAvoids} avoid-rule pairing(s) that could not be avoided.${duplicateNote}`
         : ` Pairings generated.${duplicateNote}`;
+      setGeneratingState(false);
       setStatus(`${constraintNote} Score: ${score}.`, forcedAvoids ? "warn" : "ok");
     }
 
@@ -405,7 +458,7 @@
     copyBtn.addEventListener("click", async () => {
       if (!lastResult.length) return;
       try {
-        await navigator.clipboard.writeText(toTsv(lastResult));
+        await navigator.clipboard.writeText(toTsv(lastResult, lastLocations));
         setStatus("Pairings copied as tab-separated rows.", "ok");
       } catch {
         setStatus("Clipboard copy failed in this browser. Use Download CSV instead.", "warn");
