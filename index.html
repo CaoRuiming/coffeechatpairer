@@ -17,6 +17,8 @@
     .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
     .muted { color: #57534e; }
     .status { min-height: 24px; margin-top: 12px; font-weight: 600; }
+    .notices { min-height: 24px; margin-top: 8px; }
+    .notice { font-weight: 600; }
     .warn { color: #b45309; }
     .ok { color: #166534; }
     .error { color: #b91c1c; }
@@ -67,6 +69,7 @@
       <a id="downloadBtn" class="button secondary" download="pairings.csv" aria-disabled="true">Download CSV</a>
     </div>
     <div id="status" class="status muted"></div>
+    <div id="notices" class="notices"></div>
     <p class="muted">Score meaning: lower is better. Avoid rules and recent-history matches increase the score; matching people in different non-empty locations decreases it.</p>
     <div id="output"></div>
   </div>
@@ -86,12 +89,15 @@
     const copyBtn = document.getElementById("copyBtn");
     const downloadBtn = document.getElementById("downloadBtn");
     const statusEl = document.getElementById("status");
+    const noticesEl = document.getElementById("notices");
     const outputEl = document.getElementById("output");
     const STORAGE_KEY = "coffee-chat-pairer-inputs";
 
     let lastResult = [];
     let lastLocations = new Map();
     let lastCsvUrl = "";
+    let isOutputStale = false;
+    let persistenceFailed = false;
 
     const norm = (value) => value.trim().replace(/\s+/g, " ");
     const pairKey = (a, b) => [a, b].sort().join("\u0000");
@@ -100,6 +106,17 @@
     function setStatus(message, kind = "muted") {
       statusEl.className = `status ${kind}`;
       statusEl.textContent = message;
+    }
+
+    function renderNotices() {
+      const notices = [];
+      if (isOutputStale && lastResult.length) {
+        notices.push("Inputs changed after the current pairings were generated. The table and exports may be stale.");
+      }
+      if (persistenceFailed) {
+        notices.push("Automatic browser saving failed. Your inputs may not be restored after a reload.");
+      }
+      noticesEl.innerHTML = notices.map((message) => `<div class="notice warn">${escapeHtml(message)}</div>`).join("");
     }
 
     function setGeneratingState(isGenerating) {
@@ -114,11 +131,17 @@
     }
 
     function saveInputs() {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        people: peopleInput.value,
-        avoid: avoidInput.value,
-        history: historyInput.value
-      }));
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          people: peopleInput.value,
+          avoid: avoidInput.value,
+          history: historyInput.value
+        }));
+        persistenceFailed = false;
+      } catch {
+        persistenceFailed = true;
+      }
+      renderNotices();
     }
 
     function restoreInputs() {
@@ -230,20 +253,24 @@
     }
 
     function parsePeople(text) {
-      const seen = new Set();
-      const duplicates = [];
+      const seen = new Map();
+      const duplicateGroups = new Map();
       const people = [];
       const locations = new Map();
       for (const row of rowsFromText(text)) {
         const name = row[0];
         const location = row[1] || "";
-        if (seen.has(name)) duplicates.push(name);
-        else {
-          seen.add(name);
+        const key = norm(name).toLowerCase();
+        if (seen.has(key)) {
+          if (!duplicateGroups.has(key)) duplicateGroups.set(key, [seen.get(key)]);
+          duplicateGroups.get(key).push(name);
+        } else {
+          seen.set(key, name);
           people.push(name);
           locations.set(name, location);
         }
       }
+      const duplicates = [...duplicateGroups.values()].map((group) => group.join(" / "));
       return { people, duplicates, locations };
     }
 
@@ -404,6 +431,7 @@
     function clearOutput() {
       lastResult = [];
       lastLocations = new Map();
+      isOutputStale = false;
       outputEl.innerHTML = "";
       copyBtn.disabled = true;
       regenBtn.disabled = true;
@@ -412,6 +440,7 @@
       downloadBtn.setAttribute("aria-disabled", "true");
       if (lastCsvUrl) URL.revokeObjectURL(lastCsvUrl);
       lastCsvUrl = "";
+      renderNotices();
     }
 
     async function runPairing() {
@@ -419,6 +448,10 @@
       setGeneratingState(true);
       await waitForPaint();
       const { people, duplicates, locations } = parsePeople(peopleInput.value);
+      if (duplicates.length) {
+        setGeneratingState(false);
+        return setStatus(`Duplicate names in People are not allowed. Remove or rename these entries: ${duplicates.join(", ")}.`, "warn");
+      }
       if (people.length < 2) {
         setGeneratingState(false);
         return setStatus("Enter at least two people.", "error");
@@ -439,17 +472,18 @@
       const { pairings, score } = buildPairings(people, avoidSet, historyMap, locations);
       lastResult = pairings;
       lastLocations = new Map(locations);
+      isOutputStale = false;
       renderOutput(pairings, locations);
       copyBtn.disabled = false;
       regenBtn.disabled = false;
       setDownload(toCsv(pairings, locations));
 
       const forcedAvoids = pairings.filter(([a, b]) => avoidSet.has(pairKey(a, b))).length;
-      const duplicateNote = duplicates.length ? ` Ignored duplicate names: ${duplicates.join(", ")}.` : "";
       const constraintNote = forcedAvoids
-        ? ` Generated the lowest-penalty result found, including ${forcedAvoids} avoid-rule pairing(s) that could not be avoided.${duplicateNote}`
-        : ` Pairings generated.${duplicateNote}`;
+        ? ` Generated the lowest-penalty result found, including ${forcedAvoids} avoid-rule pairing(s) that could not be avoided.`
+        : " Pairings generated.";
       setGeneratingState(false);
+      renderNotices();
       setStatus(`${constraintNote} Score: ${score}.`, forcedAvoids ? "warn" : "ok");
     }
 
@@ -464,8 +498,14 @@
         setStatus("Clipboard copy failed in this browser. Use Download CSV instead.", "warn");
       }
     });
-    [peopleInput, avoidInput, historyInput].forEach((input) => input.addEventListener("input", saveInputs));
+    function handleInputChange() {
+      if (lastResult.length) isOutputStale = true;
+      saveInputs();
+    }
+
+    [peopleInput, avoidInput, historyInput].forEach((input) => input.addEventListener("input", handleInputChange));
     restoreInputs();
+    renderNotices();
   </script>
 </body>
 </html>
