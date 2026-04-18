@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coffee Chat Pairer</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; }
+    body { max-width: 980px; margin: 0 auto; padding: 24px; line-height: 1.45; color: #1f2937; background: #f7f7f5; }
+    h1, h2 { margin: 0 0 10px; }
+    .card { background: #fff; border: 1px solid #d6d3d1; border-radius: 12px; padding: 16px; margin: 14px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    textarea { width: 100%; min-height: 180px; box-sizing: border-box; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; resize: vertical; }
+    button, a.button { display: inline-block; border: 0; border-radius: 999px; padding: 10px 14px; background: #0f766e; color: #fff; font: inherit; cursor: pointer; text-decoration: none; }
+    button.secondary, a.secondary { background: #475569; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+    .muted { color: #57534e; }
+    .status { min-height: 24px; margin-top: 12px; font-weight: 600; }
+    .warn { color: #b45309; }
+    .ok { color: #166534; }
+    .error { color: #b91c1c; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #fff; }
+    th, td { text-align: left; padding: 10px; border-bottom: 1px solid #e7e5e4; }
+    code { background: #f1f5f9; padding: 1px 5px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Coffee Chat Pairer</h1>
+  <p class="muted">Paste names and optional constraints from a spreadsheet, generate pairings, then copy or download the results.</p>
+
+  <div class="card">
+    <h2>How to Use</h2>
+    <p>1. Paste one participant per row into <b>People</b>. Spreadsheet pastes with tabs are fine; the first non-empty cell on each row is used as the name.</p>
+    <p>2. Optional: paste rows into <b>Avoid Pairing</b> where each row lists people who should not be paired with each other in any combination. Use tabs, commas, or both. Example: <code>Alice[TAB]Bob[TAB]Carol</code> or <code>Alice, Bob, Carol</code>.</p>
+    <p>3. Optional: paste past pairings into <b>Recent History</b> with one pair per row. The first two non-empty cells are used. More recent rows should be lower in the box if you want them penalized more heavily.</p>
+    <p>4. Your inputs are automatically saved in this browser while you type, so an accidental reload will restore them.</p>
+    <p>5. Click <b>Generate Pairings</b>. If you want a different valid result, click <b>Regenerate</b>. If there is an odd number of people, the app warns and does not proceed.</p>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>People</h2>
+      <p class="muted">One person per row.</p>
+      <textarea id="peopleInput" placeholder="Alice&#10;Bob&#10;Carol&#10;Dave"></textarea>
+    </section>
+
+    <section class="card">
+      <h2>Avoid Pairing</h2>
+      <p class="muted">Each row is a group of people who should avoid each other. Tabs and commas are both accepted.</p>
+      <textarea id="avoidInput" placeholder="Alice&#9;Bob&#10;Carol, Dave, Eve"></textarea>
+    </section>
+
+    <section class="card">
+      <h2>Recent History</h2>
+      <p class="muted">Each row is one previous pairing. More recent rows should be lower.</p>
+      <textarea id="historyInput" placeholder="Alice&#9;Carol&#10;Bob&#9;Dave"></textarea>
+    </section>
+  </div>
+
+  <div class="card">
+    <div class="actions">
+      <button id="generateBtn">Generate Pairings</button>
+      <button id="regenBtn" class="secondary" disabled>Regenerate</button>
+      <button id="copyBtn" class="secondary" disabled>Copy as TSV</button>
+      <a id="downloadBtn" class="button secondary" download="pairings.csv" aria-disabled="true">Download CSV</a>
+    </div>
+    <div id="status" class="status muted"></div>
+    <p class="muted">Score meaning: lower is better. A score of <code>0</code> means no avoid rules or recent-history penalties were triggered. Higher scores mean the result had to reuse recent pairings or break avoid-pairing rules because a perfect pairing was not available.</p>
+    <div id="output"></div>
+  </div>
+
+  <script>
+    const ATTEMPTS = 2500;
+    const SWAP_PASSES = 4;
+    const PENALTY_AVOID = 100000;
+    const PENALTY_HISTORY = 250;
+
+    const peopleInput = document.getElementById("peopleInput");
+    const avoidInput = document.getElementById("avoidInput");
+    const historyInput = document.getElementById("historyInput");
+    const generateBtn = document.getElementById("generateBtn");
+    const regenBtn = document.getElementById("regenBtn");
+    const copyBtn = document.getElementById("copyBtn");
+    const downloadBtn = document.getElementById("downloadBtn");
+    const statusEl = document.getElementById("status");
+    const outputEl = document.getElementById("output");
+    const STORAGE_KEY = "coffee-chat-pairer-inputs";
+
+    let lastResult = [];
+    let lastCsvUrl = "";
+
+    const norm = (value) => value.trim().replace(/\s+/g, " ");
+    const pairKey = (a, b) => [a, b].sort().join("\u0000");
+
+    function setStatus(message, kind = "muted") {
+      statusEl.className = `status ${kind}`;
+      statusEl.textContent = message;
+    }
+
+    function saveInputs() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        people: peopleInput.value,
+        avoid: avoidInput.value,
+        history: historyInput.value
+      }));
+    }
+
+    function restoreInputs() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null");
+        if (!saved) return;
+        peopleInput.value = typeof saved.people === "string" ? saved.people : "";
+        avoidInput.value = typeof saved.avoid === "string" ? saved.avoid : "";
+        historyInput.value = typeof saved.history === "string" ? saved.history : "";
+      } catch {}
+    }
+
+    function rowsFromText(text) {
+      return text.split(/\r?\n/).map((line) =>
+        line.split("\t").map(norm).filter(Boolean)
+      ).filter((row) => row.length);
+    }
+
+    function rowsFromDelimitedText(text) {
+      return text.split(/\r?\n/).map((line) =>
+        line.split(/[\t,]/).map(norm).filter(Boolean)
+      ).filter((row) => row.length);
+    }
+
+    function parsePeople(text) {
+      const seen = new Set();
+      const duplicates = [];
+      const people = [];
+      for (const row of rowsFromText(text)) {
+        const name = row[0];
+        if (seen.has(name)) duplicates.push(name);
+        else {
+          seen.add(name);
+          people.push(name);
+        }
+      }
+      return { people, duplicates };
+    }
+
+    function parseAvoid(text) {
+      const edges = new Set();
+      for (const row of rowsFromDelimitedText(text)) {
+        for (let i = 0; i < row.length; i++) {
+          for (let j = i + 1; j < row.length; j++) {
+            edges.add(pairKey(row[i], row[j]));
+          }
+        }
+      }
+      return edges;
+    }
+
+    function parseHistory(text) {
+      const historyRows = rowsFromText(text).map((row) => row.slice(0, 2)).filter((row) => row.length >= 2);
+      const penalties = new Map();
+      historyRows.forEach(([a, b], index) => {
+        const weight = PENALTY_HISTORY * (index + 1);
+        penalties.set(pairKey(a, b), Math.max(penalties.get(pairKey(a, b)) || 0, weight));
+      });
+      return penalties;
+    }
+
+    function shuffle(values) {
+      const copy = values.slice();
+      for (let i = copy.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [copy[i], copy[j]] = [copy[j], copy[i]];
+      }
+      return copy;
+    }
+
+    function scorePairings(pairings, avoidSet, historyMap) {
+      let score = 0;
+      for (const [a, b] of pairings) {
+        const key = pairKey(a, b);
+        if (avoidSet.has(key)) score += PENALTY_AVOID;
+        score += historyMap.get(key) || 0;
+      }
+      return score;
+    }
+
+    function randomPairings(people) {
+      const shuffled = shuffle(people);
+      const pairings = [];
+      for (let i = 0; i < shuffled.length; i += 2) pairings.push([shuffled[i], shuffled[i + 1]]);
+      return pairings;
+    }
+
+    function improvePairings(pairings, avoidSet, historyMap) {
+      const current = pairings.map((pair) => pair.slice());
+      let bestScore = scorePairings(current, avoidSet, historyMap);
+      for (let pass = 0; pass < SWAP_PASSES; pass++) {
+        let changed = false;
+        for (let i = 0; i < current.length; i++) {
+          for (let j = i + 1; j < current.length; j++) {
+            const [a, b] = current[i];
+            const [c, d] = current[j];
+            const options = [
+              [[a, c], [b, d]],
+              [[a, d], [b, c]]
+            ];
+            for (const option of options) {
+              const trial = current.map((pair) => pair.slice());
+              trial[i] = option[0];
+              trial[j] = option[1];
+              const trialScore = scorePairings(trial, avoidSet, historyMap);
+              if (trialScore < bestScore) {
+                current[i] = option[0];
+                current[j] = option[1];
+                bestScore = trialScore;
+                changed = true;
+              }
+            }
+          }
+        }
+        if (!changed) break;
+      }
+      return { pairings: current, score: bestScore };
+    }
+
+    function buildPairings(people, avoidSet, historyMap) {
+      let best = { pairings: randomPairings(people), score: Infinity };
+      for (let i = 0; i < ATTEMPTS; i++) {
+        const improved = improvePairings(randomPairings(people), avoidSet, historyMap);
+        if (improved.score < best.score) best = improved;
+        if (best.score === 0) break;
+      }
+      return best;
+    }
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+    }
+
+    function renderOutput(pairings) {
+      const rows = pairings.map(([a, b], index) =>
+        `<tr><td>${index + 1}</td><td>${escapeHtml(a)}</td><td>${escapeHtml(b)}</td></tr>`
+      ).join("");
+      outputEl.innerHTML = `
+        <table>
+          <thead><tr><th>#</th><th>Person 1</th><th>Person 2</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    function toTsv(pairings) {
+      return ["Person 1\tPerson 2"].concat(pairings.map(([a, b]) => `${a}\t${b}`)).join("\n");
+    }
+
+    function toCsv(pairings) {
+      const quote = (value) => `"${value.replace(/"/g, '""')}"`;
+      return ["Person 1,Person 2"].concat(pairings.map(([a, b]) => `${quote(a)},${quote(b)}`)).join("\n");
+    }
+
+    function setDownload(csvText) {
+      if (lastCsvUrl) URL.revokeObjectURL(lastCsvUrl);
+      lastCsvUrl = URL.createObjectURL(new Blob([csvText], { type: "text/csv;charset=utf-8" }));
+      downloadBtn.href = lastCsvUrl;
+      downloadBtn.classList.remove("secondary");
+      downloadBtn.removeAttribute("aria-disabled");
+    }
+
+    function clearOutput() {
+      lastResult = [];
+      outputEl.innerHTML = "";
+      copyBtn.disabled = true;
+      regenBtn.disabled = true;
+      downloadBtn.removeAttribute("href");
+      downloadBtn.classList.add("secondary");
+      downloadBtn.setAttribute("aria-disabled", "true");
+      if (lastCsvUrl) URL.revokeObjectURL(lastCsvUrl);
+      lastCsvUrl = "";
+    }
+
+    function runPairing() {
+      clearOutput();
+      const { people, duplicates } = parsePeople(peopleInput.value);
+      if (people.length < 2) return setStatus("Enter at least two people.", "error");
+      if (people.length % 2) return setStatus(`There are ${people.length} people. An even number is required to make complete pairs.`, "warn");
+
+      const avoidSet = parseAvoid(avoidInput.value);
+      const historyMap = parseHistory(historyInput.value);
+      const { pairings, score } = buildPairings(people, avoidSet, historyMap);
+      lastResult = pairings;
+      renderOutput(pairings);
+      copyBtn.disabled = false;
+      regenBtn.disabled = false;
+      setDownload(toCsv(pairings));
+
+      const forcedAvoids = pairings.filter(([a, b]) => avoidSet.has(pairKey(a, b))).length;
+      const duplicateNote = duplicates.length ? ` Ignored duplicate names: ${duplicates.join(", ")}.` : "";
+      const constraintNote = forcedAvoids
+        ? ` Generated the lowest-penalty result found, including ${forcedAvoids} avoid-rule pairing(s) that could not be avoided.${duplicateNote}`
+        : ` Pairings generated.${duplicateNote}`;
+      setStatus(`${constraintNote} Score: ${score}.`, forcedAvoids ? "warn" : "ok");
+    }
+
+    generateBtn.addEventListener("click", runPairing);
+    regenBtn.addEventListener("click", runPairing);
+    copyBtn.addEventListener("click", async () => {
+      if (!lastResult.length) return;
+      try {
+        await navigator.clipboard.writeText(toTsv(lastResult));
+        setStatus("Pairings copied as tab-separated rows.", "ok");
+      } catch {
+        setStatus("Clipboard copy failed in this browser. Use Download CSV instead.", "warn");
+      }
+    });
+    [peopleInput, avoidInput, historyInput].forEach((input) => input.addEventListener("input", saveInputs));
+    restoreInputs();
+  </script>
+</body>
+</html>
