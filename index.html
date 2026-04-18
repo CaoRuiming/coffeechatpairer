@@ -34,8 +34,9 @@
     <p>1. Paste one participant per row into <b>People</b>. Spreadsheet pastes with tabs are fine; the first non-empty cell on each row is used as the name.</p>
     <p>2. Optional: paste rows into <b>Avoid Pairing</b> where each row lists people who should not be paired with each other in any combination. Use tabs, commas, or both. Example: <code>Alice[TAB]Bob[TAB]Carol</code> or <code>Alice, Bob, Carol</code>.</p>
     <p>3. Optional: paste past pairings into <b>Recent History</b> with one pair per row. The first two non-empty cells are used. More recent rows should be lower in the box if you want them penalized more heavily.</p>
-    <p>4. Your inputs are automatically saved in this browser while you type, so an accidental reload will restore them.</p>
-    <p>5. Click <b>Generate Pairings</b>. If you want a different valid result, click <b>Regenerate</b>. If there is an odd number of people, the app warns and does not proceed.</p>
+    <p>4. Names in <b>Avoid Pairing</b> and <b>Recent History</b> are matched to <b>People</b> case-insensitively. Full names, unique first names, and email addresses like <code>john.a.doe@example.com</code> are accepted. If any reference is ambiguous or unknown, generation stops and shows a warning.</p>
+    <p>5. Your inputs are automatically saved in this browser while you type, so an accidental reload will restore them.</p>
+    <p>6. Click <b>Generate Pairings</b>. If you want a different valid result, click <b>Regenerate</b>. If there is an odd number of people, the app warns and does not proceed.</p>
   </div>
 
   <div class="grid">
@@ -47,13 +48,13 @@
 
     <section class="card">
       <h2>Avoid Pairing</h2>
-      <p class="muted">Each row is a group of people who should avoid each other. Tabs and commas are both accepted.</p>
+      <p class="muted">Each row is a group of people who should avoid each other. Tabs and commas are both accepted, and names are matched fuzzily against People.</p>
       <textarea id="avoidInput" placeholder="Alice&#9;Bob&#10;Carol, Dave, Eve"></textarea>
     </section>
 
     <section class="card">
       <h2>Recent History</h2>
-      <p class="muted">Each row is one previous pairing. More recent rows should be lower.</p>
+      <p class="muted">Each row is one previous pairing. More recent rows should be lower. Names are matched fuzzily against People.</p>
       <textarea id="historyInput" placeholder="Alice&#9;Carol&#10;Bob&#9;Dave"></textarea>
     </section>
   </div>
@@ -92,6 +93,7 @@
 
     const norm = (value) => value.trim().replace(/\s+/g, " ");
     const pairKey = (a, b) => [a, b].sort().join("\u0000");
+    const tokenKey = (tokens) => tokens.join("\u0000");
 
     function setStatus(message, kind = "muted") {
       statusEl.className = `status ${kind}`;
@@ -128,6 +130,88 @@
       ).filter((row) => row.length);
     }
 
+    function nameTokens(value) {
+      return norm(value).toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    }
+
+    function emailTokens(value) {
+      const email = norm(value).toLowerCase();
+      if (!email.includes("@")) return null;
+      const local = email.split("@")[0];
+      const tokens = local.split(/[._-]+/).map((token) => token.replace(/\d+$/g, "")).filter(Boolean);
+      return tokens.length ? tokens : null;
+    }
+
+    function buildResolver(people) {
+      const exactMap = new Map();
+      const sequenceMap = new Map();
+      const firstNameMap = new Map();
+
+      for (const person of people) {
+        const exactKey = norm(person).toLowerCase();
+        const tokens = nameTokens(person);
+        exactMap.set(exactKey, person);
+
+        const seqKey = tokenKey(tokens);
+        if (!sequenceMap.has(seqKey)) sequenceMap.set(seqKey, []);
+        sequenceMap.get(seqKey).push(person);
+
+        const first = tokens[0];
+        if (first) {
+          if (!firstNameMap.has(first)) firstNameMap.set(first, []);
+          firstNameMap.get(first).push(person);
+        }
+      }
+
+      return function resolvePerson(rawValue) {
+        const raw = norm(rawValue);
+        if (!raw) return { ok: false, reason: "unmatched", input: rawValue, matches: [] };
+
+        const exact = exactMap.get(raw.toLowerCase());
+        if (exact) return { ok: true, value: exact };
+
+        const candidates = new Set();
+        const directTokens = nameTokens(raw);
+        const derivedEmailTokens = emailTokens(raw);
+        const sequenceCandidates = [directTokens, derivedEmailTokens].filter((tokens) => tokens && tokens.length);
+
+        for (const tokens of sequenceCandidates) {
+          const matches = sequenceMap.get(tokenKey(tokens)) || [];
+          for (const match of matches) candidates.add(match);
+        }
+
+        if (directTokens.length === 1) {
+          const firstMatches = firstNameMap.get(directTokens[0]) || [];
+          if (firstMatches.length === 1) return { ok: true, value: firstMatches[0] };
+          for (const match of firstMatches) candidates.add(match);
+        }
+
+        if (candidates.size === 1) return { ok: true, value: [...candidates][0] };
+        if (candidates.size > 1) return { ok: false, reason: "ambiguous", input: raw, matches: [...candidates].sort() };
+        return { ok: false, reason: "unmatched", input: raw, matches: [] };
+      };
+    }
+
+    function resolveRows(rows, resolvePerson) {
+      const resolvedRows = [];
+      const issues = [];
+
+      for (const row of rows) {
+        const resolved = [];
+        for (const value of row) {
+          const match = resolvePerson(value);
+          if (!match.ok) {
+            issues.push(match);
+            continue;
+          }
+          if (!resolved.includes(match.value)) resolved.push(match.value);
+        }
+        if (resolved.length) resolvedRows.push(resolved);
+      }
+
+      return { resolvedRows, issues };
+    }
+
     function parsePeople(text) {
       const seen = new Set();
       const duplicates = [];
@@ -143,26 +227,38 @@
       return { people, duplicates };
     }
 
-    function parseAvoid(text) {
+    function parseAvoid(text, resolvePerson) {
       const edges = new Set();
-      for (const row of rowsFromDelimitedText(text)) {
+      const { resolvedRows, issues } = resolveRows(rowsFromDelimitedText(text), resolvePerson);
+      for (const row of resolvedRows) {
         for (let i = 0; i < row.length; i++) {
           for (let j = i + 1; j < row.length; j++) {
             edges.add(pairKey(row[i], row[j]));
           }
         }
       }
-      return edges;
+      return { edges, issues };
     }
 
-    function parseHistory(text) {
+    function parseHistory(text, resolvePerson) {
       const historyRows = rowsFromText(text).map((row) => row.slice(0, 2)).filter((row) => row.length >= 2);
+      const { resolvedRows, issues } = resolveRows(historyRows, resolvePerson);
       const penalties = new Map();
-      historyRows.forEach(([a, b], index) => {
+      resolvedRows.filter((row) => row.length >= 2).forEach(([a, b], index) => {
         const weight = PENALTY_HISTORY * (index + 1);
         penalties.set(pairKey(a, b), Math.max(penalties.get(pairKey(a, b)) || 0, weight));
       });
-      return penalties;
+      return { penalties, issues };
+    }
+
+    function formatIssues(issues) {
+      if (!issues.length) return "";
+      const lines = issues.map((issue) =>
+        issue.reason === "ambiguous"
+          ? `"${issue.input}" is ambiguous: could match ${issue.matches.join(", ")}`
+          : `"${issue.input}" does not match anyone in People`
+      );
+      return `Fix these references before generating pairings: ${lines.join(" ; ")}`;
     }
 
     function shuffle(values) {
@@ -284,8 +380,11 @@
       if (people.length < 2) return setStatus("Enter at least two people.", "error");
       if (people.length % 2) return setStatus(`There are ${people.length} people. An even number is required to make complete pairs.`, "warn");
 
-      const avoidSet = parseAvoid(avoidInput.value);
-      const historyMap = parseHistory(historyInput.value);
+      const resolvePerson = buildResolver(people);
+      const { edges: avoidSet, issues: avoidIssues } = parseAvoid(avoidInput.value, resolvePerson);
+      const { penalties: historyMap, issues: historyIssues } = parseHistory(historyInput.value, resolvePerson);
+      const issues = avoidIssues.concat(historyIssues);
+      if (issues.length) return setStatus(formatIssues(issues), "warn");
       const { pairings, score } = buildPairings(people, avoidSet, historyMap);
       lastResult = pairings;
       renderOutput(pairings);
