@@ -40,7 +40,7 @@
     <p>3. Optional: paste past pairings into <b>Recent History</b> with one pair per row. The first two non-empty cells are used. More recent rows should be lower in the box if you want them penalized more heavily.</p>
     <p>4. Names in <b>Avoid Pairing</b> and <b>Recent History</b> are matched to <b>People</b> case-insensitively. Full names, unique first names, and email addresses like <code>john.a.doe@example.com</code> are accepted. If any reference is ambiguous or unknown, generation stops and shows a warning.</p>
     <p>5. Your inputs are automatically saved in this browser while you type, so an accidental reload will restore them.</p>
-    <p>6. Click <b>Generate Pairings</b>. If you want a different valid result, click <b>Regenerate</b>. If there is an odd number of people, the app warns and does not proceed.</p>
+    <p>6. Click <b>Generate Pairings</b>. Click it again any time you want a different valid result. If there is an odd number of people, the app warns and does not proceed.</p>
   </div>
 
   <div class="grid">
@@ -66,7 +66,6 @@
   <div class="card">
     <div class="actions">
       <button id="generateBtn">Generate Pairings</button>
-      <button id="regenBtn" class="secondary" disabled>Regenerate</button>
       <button id="copyBtn" class="secondary" disabled>Copy as TSV</button>
       <a id="downloadBtn" class="button secondary" download="pairings.csv" aria-disabled="true">Download CSV</a>
     </div>
@@ -93,7 +92,6 @@
     const avoidInput = document.getElementById("avoidInput");
     const historyInput = document.getElementById("historyInput");
     const generateBtn = document.getElementById("generateBtn");
-    const regenBtn = document.getElementById("regenBtn");
     const copyBtn = document.getElementById("copyBtn");
     const downloadBtn = document.getElementById("downloadBtn");
     const showLocationsToggle = document.getElementById("showLocationsToggle");
@@ -131,7 +129,6 @@
 
     function setGeneratingState(isGenerating) {
       generateBtn.disabled = isGenerating;
-      regenBtn.disabled = isGenerating || !lastResult.length;
       copyBtn.disabled = isGenerating || !lastResult.length;
       if (isGenerating) setStatus("Generating pairings...", "muted");
     }
@@ -453,7 +450,6 @@
       showLocationsToggle.checked = false;
       outputEl.innerHTML = "";
       copyBtn.disabled = true;
-      regenBtn.disabled = true;
       downloadBtn.removeAttribute("href");
       downloadBtn.classList.add("secondary");
       downloadBtn.setAttribute("aria-disabled", "true");
@@ -496,7 +492,6 @@
       showLocationsToggle.checked = false;
       renderOutput(pairings, locations, showLocationsInOutput);
       copyBtn.disabled = false;
-      regenBtn.disabled = false;
       setDownload(toCsv(pairings, locations, showLocationsInOutput));
 
       const forcedAvoids = pairings.filter(([a, b]) => avoidSet.has(pairKey(a, b))).length;
@@ -509,7 +504,6 @@
     }
 
     generateBtn.addEventListener("click", runPairing);
-    regenBtn.addEventListener("click", runPairing);
     copyBtn.addEventListener("click", async () => {
       if (!lastResult.length) return;
       try {
